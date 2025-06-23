@@ -103,6 +103,7 @@ export default function CoachScreen() {
   const [planGenerated, setPlanGenerated] = useState(false);
   const [userId, setUserId] = useState<string | null>(null);
 
+
   useEffect(() => {
     const checkExistingData = async () => {
       const { data: userData } = await supabase.auth.getUser();
@@ -110,25 +111,27 @@ export default function CoachScreen() {
       if (!uid) return;
       setUserId(uid);
 
+      // Profil laden
       const { data: profile, error: profileError } = await supabase
         .from('coach_profiles')
         .select('*')
         .eq('user_id', uid)
         .single();
 
+      // Trainingsplan laden (mindestens 1 Eintrag)
       const { data: plan, error: planError } = await supabase
         .from('training_plan')
-        .select('id')
+        .select('*')
         .eq('user_id', uid)
         .limit(1);
 
+      console.log('User:', uid, 'Profil:', profile, 'Trainingsplan:', plan);
+
       if (profile && plan && plan.length > 0) {
-        // ✅ Benutzer hat Profil & Plan → Formular überspringen
         setPlanGenerated(true);
       } else if (profile) {
-        // 🟡 Benutzer hat Profil, aber keinen Plan → evtl. neu generieren
         setFormData(profile);
-        setStepIndex(steps.length - 1); // direkt zur Plan-Erstellung
+        setStepIndex(steps.length - 1);
       }
     };
 
@@ -169,9 +172,7 @@ export default function CoachScreen() {
         target_event_date: formData.target_event_date || null,
         target_event_distance: formData.target_event_distance || null,
         target_event_time: formData.target_event_time || null,
-        time_budget: formData.time_budget?.trim()
-          ? JSON.parse(`[${formData.time_budget.trim()}]`)
-          : null,
+        time_budget: formData.time_budget ? String(formData.time_budget) : null,
         health_info: formData.health_info || null,
         height: formData.height ? Number(formData.height) : null,
         weight: formData.weight ? Number(formData.weight) : null,
@@ -182,9 +183,9 @@ export default function CoachScreen() {
       if (profileError) throw profileError;
 
       // OpenAI Prompt: Reines JSON erzwingen
-      const today = new Date().toISOString().split('T')[0];
-
-      const prompt = `Erstelle einen strukturierten Lauftrainingsplan im JSON-Format. Keine Kommentare, keine Erklärungen – nur reines JSON:
+      const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+      const prompt = `Du bist ein erfahrener, professioneller Laufcoach. Erstelle einen individuellen, strukturierten Lauftrainingsplan im JSON-Format. 
+      Gib als Antwort ausschließlich ein valides JSON-Array zurück – KEINEN Text, KEINE Kommentare, KEINE Erklärungen, KEIN Fließtext, KEINE Markdown-Formatierung.
 
       [
         {
@@ -203,15 +204,19 @@ export default function CoachScreen() {
       Berücksichtige die folgende Person:
       ${JSON.stringify(formData)}
 
-      Deine Aufgabe:
-      - Plane individuell basierend auf Erfahrung, Ziel, Zeitbudget und Eventdatum.
+      **WICHTIG:**
+      - Der Plan MUSS GENAU 4 Wochen umfassen.
+      - Jede Woche MUSS EXAKT ${Number(formData.time_budget)} Trainingseinheiten enthalten. Keine Woche darf mehr oder weniger Einheiten haben.
+      - Die Einheiten sollen sich progressiv steigern (Umfang, Intensität, Abwechslung).
+      - Passe den Plan unbedingt an die Lauferfahrung und den aktuellen Trainingsstand an (${formData.experience}, ${formData.performance}).
+      - Führe Anfänger langsam und sicher an längere Distanzen heran, ohne Überforderung.
+      - Plane realistisch ab dem ${today} für 4 Wochen.
       - Typen: "intervall", "longrun", "tempo", "recovery", "base"
       - Verwende unterschiedliche Inhalte pro Einheit.
       - Gib für passende Einheiten eine realistische Zielpace in min/km an.
       - Füge kurze erklärende Texte hinzu.
-      - Beginne am ${today} und plane realistisch bis zum Wettkampf oder allgemeinen Ziel.
-
-      Antworte **nur** mit einem reinen JSON-Array.
+      - Antworte NUR mit einem reinen JSON-Array mit GENAU ${4 * Number(formData.time_budget)} Einträgen.
+      - KEINE Kommentare, KEINE Erklärungen, KEINE Abweichungen von den Vorgaben!
       `;
 
       // API Call an OpenAI
@@ -226,7 +231,7 @@ export default function CoachScreen() {
       // JSON robust extrahieren
       let parsed;
       try {
-        const match = raw.match(/\[.*\]/s); // s = dotAll für Zeilenumbrüche
+        const match = raw.match(/\[[\s\S]*\]/); // [ und ] inklusive Zeilenumbrüche
         if (!match) throw new Error('Kein gültiges JSON-Array gefunden');
         parsed = JSON.parse(match[0]);
       } catch (parseErr) {
@@ -266,7 +271,88 @@ export default function CoachScreen() {
   };
 
   if (planGenerated && userId) {
-    return <WeeklyTrainingView userId={userId} />;
+    return (
+      <WeeklyTrainingView
+        userId={userId}
+        onExtendPlan={handleExtendPlan} // <-- HIER hinzufügen!
+      />
+    );
+  }
+
+  async function handleExtendPlan(userWish: string, startDate: string) {
+    if (!userId) return;
+    try {
+      // 1. Letzte 10 Einheiten laden
+      const { data: lastWorkouts, error } = await supabase
+        .from('training_plan')
+        .select('*')
+        .eq('user_id', userId)
+        .order('date', { ascending: false })
+        .limit(10);
+
+      if (error) {
+        console.error('Fehler beim Laden der letzten Einheiten:', error);
+        return;
+      }
+
+      // 2. Prompt bauen
+      const prompt = `
+  Du bist ein erfahrener Laufcoach. Erweitere den bestehenden Trainingsplan um 2-4 weitere Wochen.
+  Berücksichtige die letzten 10 Einheiten (JSON unten) und folgende Wünsche des Nutzers: "${userWish || 'keine'}".
+  Erstelle NUR neue Einheiten ab dem Tag nach ${startDate}.
+  Antworte ausschließlich mit einem JSON-Array neuer Einheiten im gleichen Format wie bisher.
+  KEINE Kommentare, KEINE Erklärungen, KEIN Fließtext!
+
+  Letzte 10 Einheiten:
+  ${JSON.stringify(lastWorkouts, null, 2)}
+  `;
+
+      // 3. KI-Aufruf
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4',
+        messages: [{ role: 'user', content: prompt }],
+      });
+
+      const raw = completion.choices[0].message.content;
+      let parsed;
+      try {
+        if (!raw) throw new Error('Keine Antwort von OpenAI erhalten');
+        const match = raw.match(/\[[\s\S]*\]/);
+        if (!match) throw new Error('Kein gültiges JSON-Array gefunden');
+        parsed = JSON.parse(match[0]);
+      } catch (parseErr) {
+        console.error('Fehler beim Parsen der OpenAI-Antwort:', raw);
+        return;
+      }
+
+      // 4. Neue Einheiten speichern
+      const insert = await supabase.from('training_plan').insert(
+        parsed.map((t: any) => ({
+          user_id: userId,
+          date: t.date || null,
+          weekday: t.weekday || null,
+          title: t.title || 'Unbenannt',
+          description: t.description || '',
+          distance_km:
+            t.distance_km !== undefined && !isNaN(parseFloat(t.distance_km))
+              ? parseFloat(t.distance_km)
+              : null,
+          duration_minutes:
+            t.duration_minutes !== undefined && !isNaN(parseInt(t.duration_minutes))
+              ? parseInt(t.duration_minutes)
+              : null,
+          type: t.type || 'unspecified',
+          target_pace_min_per_km: t.target_pace_min_per_km || null,
+          explanation: t.explanation || null,
+        }))
+      );
+      if (insert.error) {
+        console.error('Fehler beim Speichern der neuen Einheiten:', insert.error);
+        return;
+      }
+    } catch (e) {
+      console.error('Fehler beim Erweitern des Plans:', e);
+    }
   }
 
   return (
