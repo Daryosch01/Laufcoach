@@ -96,7 +96,9 @@ export default function ProfileScreen() {
       <Pressable
         style={styles.startRouteButton}
         onPress={() => navigation.navigate('Activity', {
-          routeCoordinates: item.coordinates,
+          routeCoordinates: Array.isArray(item.coordinates[0])
+            ? item.coordinates.flat()
+            : item.coordinates,
           routeDistance: item.distance,
           routeName: item.name,
         })}
@@ -166,7 +168,7 @@ export default function ProfileScreen() {
               }}
             >
               {selectedRoute?.coordinates && (
-                <Polyline coordinates={selectedRoute.coordinates} strokeWidth={4} strokeColor="blue" />
+                <Polyline coordinates={selectedRoute.coordinates} strokeWidth={4} strokeColor="green" />
               )}
             </MapView>
             <Pressable style={styles.closeButton} onPress={closeModal}>

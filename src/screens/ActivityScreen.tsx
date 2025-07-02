@@ -23,6 +23,32 @@ import { OPENAI_API_KEY, GOOGLE_MAPS_API_KEY } from '@env';
 import { speakWithElevenLabs } from '../services/elevenlabsService';
 import * as Battery from 'expo-battery';
 import { Audio } from 'expo-av';
+import { useNavigation } from '@react-navigation/native';
+import { getDistance, findClosestStepIndex, snapToRoute, getGermanInstruction } from '../utils/navigationUtils';
+
+function formatPace(pace: number): string {
+  if (!isFinite(pace) || pace <= 0) return "0:00";
+  const min = Math.floor(pace);
+  const sec = Math.round((pace - min) * 60);
+  return `${min}:${sec.toString().padStart(2, '0')}`;
+}
+
+function formatPaceSpoken(pace: number): string {
+  if (!isFinite(pace) || pace <= 0) return "unbekannt";
+  const min = Math.floor(pace);
+  const sec = Math.round((pace - min) * 60);
+  return `${min} Minuten und ${sec} Sekunden pro Kilometer`;
+}
+
+function chunkRoute(route: LatLng[], chunkSize: number = 8): LatLng[][] {
+  const chunks = [];
+  for (let i = 0; i < route.length - 1; i += chunkSize) {
+    // Jeder Chunk hat Start, bis zu chunkSize Wegpunkte, und Ziel
+    const chunk = route.slice(i, i + chunkSize + 1);
+    chunks.push(chunk);
+  }
+  return chunks;
+}
 
 export type RootStackParamList = {
   Activity: {
@@ -56,8 +82,13 @@ async function fetchGoogleDirections(
       : '';
   const url = `https://maps.googleapis.com/maps/api/directions/json?origin=${originStr}&destination=${destStr}${waypointsStr}&mode=walking&language=de&key=${GOOGLE_MAPS_API_KEY}`;
 
+  console.log('Directions-URL:', url);
+
   const res = await fetch(url);
   const json = await res.json();
+
+  console.log('Directions-API-Response:', json);
+
   return json;
 }
 // --- ENDE GOOGLE DIRECTIONS NAVIGATION ---
@@ -101,6 +132,7 @@ const checkBatterySaver = async (): Promise<boolean> => {
 
 export default function ActivityScreen() {
   const route = useRoute<RouteProp<RootStackParamList, 'Activity'>>();
+  const navigation = useNavigation();
   const routeCoordinates = route.params?.routeCoordinates;
   const routeDistance = route.params?.routeDistance;
   const routeName = route.params?.routeName; 
@@ -142,12 +174,47 @@ export default function ActivityScreen() {
   // Automatischer Start nur EINMAL pro Route
   const [autoStarted, setAutoStarted] = useState(false);
 
+  function splitRouteToFineSteps(route: LatLng[], stepDist = 0.01): LatLng[] {
+    if (!route || route.length < 2) return [];
+    const fineSteps: LatLng[] = [route[0]];
+    let last = route[0];
+    let accDist = 0;
+    for (let i = 1; i < route.length; i++) {
+      const curr = route[i];
+      const d = calculateDistance([last, curr]);
+      accDist += d;
+      if (accDist >= stepDist) {
+        fineSteps.push(curr);
+        last = curr;
+        accDist = 0;
+      }
+    }
+    if (fineSteps[fineSteps.length - 1] !== route[route.length - 1]) {
+      fineSteps.push(route[route.length - 1]);
+    }
+    return fineSteps;
+  }
+
   useEffect(() => {
-    if (routeCoordinates && routeDistance) {
-      setTargetRoute(routeCoordinates);
-      setTargetDistance(routeDistance);
+    if (routeCoordinates && routeCoordinates.length > 1) {
+      setTargetRoute(
+        Array.isArray(routeCoordinates[0])
+          ? routeCoordinates.flat()
+          : routeCoordinates
+      );
+      setTargetDistance(routeDistance ?? null);
+      setPath([]);
+      setAutoStarted(false); 
     }
   }, [routeCoordinates, routeDistance]);
+
+  useEffect(() => {
+    if (targetRoute && targetRoute.length > 1) {
+      const fineSteps = splitRouteToFineSteps(targetRoute, 0.01); // 0.01km = 10 Meter
+      setNavSteps(fineSteps);
+    }
+  }, [targetRoute]); 
+
 
   // Automatischer Start NUR wenn Route übergeben wurde (Routenstart)
   useEffect(() => {
@@ -165,6 +232,14 @@ export default function ActivityScreen() {
 
   // Setze autoStarted zurück, wenn Workout beendet oder abgebrochen wird
   const stopTracking = async () => {
+
+    navigation.setParams({
+      routeCoordinates: undefined,
+      routeDistance: undefined,
+      routeName: undefined,
+    } as any);
+
+    setTargetRoute(null);
     setTracking(false);
     setPaused(false);
     setAutoStarted(false);
@@ -205,47 +280,93 @@ export default function ActivityScreen() {
     setCalories(0);
     setAveragePace(0);
     setPath([]);
+    setTargetRoute(null);
+
+    navigation.setParams({
+      routeCoordinates: undefined,
+      routeDistance: undefined,
+      routeName: undefined,
+    } as any);
+
   };
 
 
   // --- GOOGLE DIRECTIONS NAVIGATION ---
   // Directions laden NUR wenn Route übergeben wurde
   useEffect(() => {
-    if (
-      routeCoordinates &&
-      routeCoordinates.length > 1 &&
-      targetRoute &&
-      targetRoute.length > 1
-    ) {
-      const start = targetRoute[0];
-      const ziel = targetRoute[targetRoute.length - 1];
-      const waypoints = targetRoute.slice(1, -1);
-      fetchGoogleDirections(start, ziel, waypoints).then(directions => {
-        const steps = directions.routes[0]?.legs[0]?.steps || [];
-        setNavSteps(steps);
+    console.log('Directions useEffect check', {
+      routeCoordinates,
+      targetRoute,
+      length: routeCoordinates?.length,
+      targetLength: targetRoute?.length
+    });
 
-        // Polyline für die Karte extrahieren
-        const polyline = [];
-        for (const step of steps) {
-          polyline.push({
-            latitude: step.start_location.lat,
-            longitude: step.start_location.lng,
-          });
+    // --- Fix: Route flach machen, falls verschachtelt ---
+    const flatRoute =
+      Array.isArray(targetRoute) && Array.isArray(targetRoute[0])
+        ? targetRoute.flat()
+        : targetRoute;
+
+    if (flatRoute && flatRoute.length > 1) {
+      const chunks = chunkRoute(flatRoute, 25);
+
+      const fetchAllDirections = async () => {
+        let allSteps: any[] = [];
+        let allPolyline: LatLng[] = [];
+
+        for (const chunk of chunks) {
+          const start = chunk[0];
+          const ziel = chunk[chunk.length - 1];
+          const waypoints = chunk.slice(1, -1);
+
+          console.log('fetchGoogleDirections wird aufgerufen', { start, ziel, waypoints });
+
+          const directions = await fetchGoogleDirections(start, ziel, waypoints);
+          const leg = directions?.routes?.[0]?.legs?.[0];
+          const steps = leg?.steps || [];
+          allSteps = allSteps.concat(steps);
+
+          // Polyline für diesen Abschnitt extrahieren
+          for (const step of steps) {
+            allPolyline.push({
+              latitude: step.start_location.lat,
+              longitude: step.start_location.lng,
+            });
+          }
+          if (steps.length > 0) {
+            allPolyline.push({
+              latitude: steps[steps.length - 1].end_location.lat,
+              longitude: steps[steps.length - 1].end_location.lng,
+            });
+          }
         }
-        // Zielpunkt hinzufügen
-        if (steps.length > 0) {
-          polyline.push({
-            latitude: steps[steps.length - 1].end_location.lat,
-            longitude: steps[steps.length - 1].end_location.lng,
-          });
-        }
-        setPolylineCoords(polyline);
-      });
+
+        //setNavSteps(allSteps);
+        setPolylineCoords(allPolyline);
+        console.log('Directions geladen:', allSteps);
+      };
+
+      fetchAllDirections();
     }
   }, [routeCoordinates, targetRoute]);
   // --- ENDE GOOGLE DIRECTIONS NAVIGATION ---
 
-  const speechQueue = useRef<string[]>([]);
+  const speechQueue = useRef<{ type: 'nav' | 'pace' | 'motivation', text: string }[]>([]);
+  
+  function enqueueSpeech(type: 'nav' | 'pace' | 'motivation', text: string) {
+    if (type === 'nav') {
+      speechQueue.current.unshift({ type, text }); // Navigation immer vorne
+    } else {
+      // Nach Navigation, aber vor anderen pace/motivation
+      const navIdx = speechQueue.current.findIndex(item => item.type !== 'nav');
+      if (navIdx === -1) {
+        speechQueue.current.push({ type, text });
+      } else {
+        speechQueue.current.splice(navIdx, 0, { type, text });
+      }
+    }
+  } 
+  
   const isSpeaking = useRef(false);
 
   const [germanMaleVoice, setGermanMaleVoice] = useState<string | undefined>(undefined);
@@ -283,7 +404,10 @@ export default function ActivityScreen() {
       const decimalPace = min + sec / 60;
       setTargetPace(decimalPace);
     }
-  }, []);
+    if (trainingData?.distance_km) {
+      setTargetDistance(trainingData.distance_km);
+    }
+  }, [trainingData]);
 
   const watchRef = useRef<Location.LocationSubscription | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -371,7 +495,10 @@ export default function ActivityScreen() {
       lastAnnouncedKm.current = Math.floor(distance);
 
       giveMotivationalFeedback(distance, averagePace, targetPace).then((motivation) => {
-        if (motivation) speechQueue.current.push(motivation);
+        enqueueSpeech(
+          'pace',
+          `Du hast ${currentKm} Kilometer geschafft. Deine aktuelle Pace ist ${formatPaceSpoken(averagePace)}. ${motivation ?? ""}`
+        );
       });
     }
 
@@ -381,7 +508,7 @@ export default function ActivityScreen() {
       distance >= targetDistance - 1 &&
       distance < targetDistance
     ) {
-      speechQueue.current.push("Letzter Kilometer! Gib nochmal alles!");
+      enqueueSpeech('pace', "Letzter Kilometer! Gib nochmal alles!");
       setLastKmAnnounced(true);
     }
 
@@ -391,7 +518,7 @@ export default function ActivityScreen() {
       distance >= targetDistance - 0.1 &&
       distance < targetDistance
     ) {
-      speechQueue.current.push("Nur noch 100 Meter! Endspurt!");
+      enqueueSpeech('pace', "Nur noch 100 Meter! Endspurt!");
       setLast100mAnnounced(true);
     }
   }, [distance, averagePace, targetPace, tracking, paused, lastKmAnnounced, last100mAnnounced, targetDistance]);
@@ -402,37 +529,93 @@ export default function ActivityScreen() {
     lastAnnouncedKm.current = 0;
   }, [tracking, trainingData]);
 
+  
+  const lastPaceFeedbackKm = useRef(-1);
+  const paceFeedbacksThisKm = useRef(0);
+  const lastPaceFeedbackMeter = useRef(0);
+
   useEffect(() => {
-    if (!tracking || paused || !targetPace || averagePace === 0) return;
+    if (!tracking || paused || distance < 0.1) return;
 
-    const paceDifference = averagePace - targetPace;
+    const currentKm = Math.floor(distance);
+    const meterInKm = distance - currentKm;
 
-    // Zu langsam
-    if (paceDifference > 0.3 && lastAnnouncedKm.current < Math.floor(distance)) {
-      giveMotivationalFeedback(distance, averagePace, targetPace, true, false).then((motivation) => {
-        if (motivation) speechQueue.current.push(motivation);
-      });
-      lastAnnouncedKm.current = Math.floor(distance);
+    // --- Zähler für Pace-Feedbacks bei neuem Kilometer zurücksetzen ---
+    if (currentKm !== lastPaceFeedbackKm.current) {
+      paceFeedbacksThisKm.current = 0;
+      lastPaceFeedbackKm.current = currentKm;
+      lastPaceFeedbackMeter.current = 0;
     }
 
-    // Zu schnell
-    if (paceDifference < -0.3 && lastAnnouncedKm.current < Math.floor(distance)) {
-      giveMotivationalFeedback(distance, averagePace, targetPace, false, true).then((motivation) => {
-        if (motivation) speechQueue.current.push(motivation);
+    // DEBUG: Logge alle relevanten Werte
+    // console.log(
+    //   'distance:', distance,
+    //   'currentKm:', currentKm,
+    //   'meterInKm:', meterInKm,
+    //   'averagePace:', averagePace,
+    //   'targetPace:', targetPace,
+    //   'paceDiff:', averagePace - (targetPace ?? 0),
+    //   'lastPaceFeedbackKm:', lastPaceFeedbackKm.current,
+    //   'paceFeedbacksThisKm:', paceFeedbacksThisKm.current,
+    //   'lastPaceFeedbackMeter:', lastPaceFeedbackMeter.current
+    // );
+
+    // --- Kilometeransage + Motivation ---
+    if (
+      tracking &&
+      !paused &&
+      averagePace > 0 &&
+      currentKm > lastAnnouncedKm.current
+    ) {
+      lastAnnouncedKm.current = currentKm;
+      lastPaceFeedbackKm.current = currentKm; // Pace-Feedback in diesem km unterdrücken
+      paceFeedbacksThisKm.current = 0;
+      lastPaceFeedbackMeter.current = 0;
+
+      giveMotivationalFeedback(distance, averagePace, targetPace).then((motivation) => {
+        enqueueSpeech(
+          'pace',
+          `Du hast ${currentKm} Kilometer geschafft. Deine aktuelle Pace ist ${formatPaceSpoken(averagePace)}. ${motivation ?? ""}`
+        );
       });
-      lastAnnouncedKm.current = Math.floor(distance);
+      return;
     }
-  }, [averagePace, targetPace, tracking, paused, distance]);
+
+    // --- Pace-Feedback (max 2x pro km, mind. 500m Abstand, nicht in den ersten 100m), nur wenn targetPace vorhanden ---
+    if (
+      targetPace &&
+      averagePace > 0 &&
+      paceFeedbacksThisKm.current < 2 &&
+      meterInKm > 0.1 && // weiter als 100m nach dem letzten vollen km
+      (meterInKm - lastPaceFeedbackMeter.current > 0.5 || paceFeedbacksThisKm.current === 0) // mind. 500m Abstand nach dem ersten Feedback
+    ) {
+      const paceDifference = averagePace - targetPace;
+
+      if (paceDifference > 0.3) {
+        giveMotivationalFeedback(distance, averagePace, targetPace, true, false).then((motivation) => {
+          if (motivation) enqueueSpeech('motivation', motivation);
+        });
+        paceFeedbacksThisKm.current += 1;
+        lastPaceFeedbackMeter.current = meterInKm;
+      } else if (paceDifference < -0.3) {
+        giveMotivationalFeedback(distance, averagePace, targetPace, false, true).then((motivation) => {
+          if (motivation) enqueueSpeech('motivation', motivation);
+        });
+        paceFeedbacksThisKm.current += 1;
+        lastPaceFeedbackMeter.current = meterInKm;
+      }
+    }
+  }, [distance, averagePace, targetPace, tracking, paused]);
 
   useEffect(() => {
     const playQueue = async () => {
       if (isSpeaking.current || speechQueue.current.length === 0) return;
 
       isSpeaking.current = true;
-      const nextText = speechQueue.current.shift();
-      if (nextText) {
-        await speakWithElevenLabs(nextText);
-      }
+        const next = speechQueue.current.shift();
+        if (next) {
+          await speakWithElevenLabs(next.text);
+        }
       isSpeaking.current = false;
     };
 
@@ -470,10 +653,14 @@ export default function ActivityScreen() {
         distanceInterval: 1,
       },
       (loc) => {
-        const newCoord = {
+        let newCoord = {
           latitude: loc.coords.latitude,
           longitude: loc.coords.longitude,
         };
+        // --- Snap-to-Route (nur wenn Route vorhanden)
+        if (targetRoute && targetRoute.length > 1) {
+          newCoord = snapToRoute(newCoord, targetRoute);
+        }
         setRegion(newCoord);
         setPath((prev) => {
           const updated = [...prev, newCoord];
@@ -483,6 +670,27 @@ export default function ActivityScreen() {
         });
       }
     );
+
+    // watchRef.current = await Location.watchPositionAsync(
+    //   {
+    //     accuracy: Location.Accuracy.Highest,
+    //     timeInterval: 1000,
+    //     distanceInterval: 1,
+    //   },
+    //   (loc) => {
+    //     const newCoord = {
+    //       latitude: loc.coords.latitude,
+    //       longitude: loc.coords.longitude,
+    //     };
+    //     setRegion(newCoord);
+    //     setPath((prev) => {
+    //       const updated = [...prev, newCoord];
+    //       const dist = calculateDistance(updated);
+    //       setDistance(dist);
+    //       return updated;
+    //     });
+    //   }
+    // );
   };
 
   const beginCountdown = () => {
@@ -570,6 +778,7 @@ export default function ActivityScreen() {
     setAveragePace(0);
     setPath([]);
     setTargetPace(null);
+    setTargetRoute(null);
     lastAnnouncedKm.current = 0;
   };
 
@@ -614,30 +823,178 @@ export default function ActivityScreen() {
 
   // --- GOOGLE DIRECTIONS NAVIGATION ---
   // Navigationsansagen nur wenn Route übergeben wurde
+  const [lastStepIdxSpoken, setLastStepIdxSpoken] = useState(-1);
+
+  function getBearing(a: LatLng, b: LatLng) {
+    const toRad = (v: number) => (v * Math.PI) / 180;
+    const toDeg = (v: number) => (v * 180) / Math.PI;
+    const dLon = toRad(b.longitude - a.longitude);
+    const lat1 = toRad(a.latitude);
+    const lat2 = toRad(b.latitude);
+    const y = Math.sin(dLon) * Math.cos(lat2);
+    const x = Math.cos(lat1) * Math.sin(lat2) -
+              Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+    return (toDeg(Math.atan2(y, x)) + 360) % 360;
+  }
+
   useEffect(() => {
-    if (
-      !tracking ||
-      navSteps.length === 0 ||
-      path.length === 0 ||
-      !routeCoordinates
-    ) return;
+    if (!tracking || navSteps.length === 0 || path.length === 0 || !routeCoordinates) return;
+
     const currentPos = path[path.length - 1];
-    const nextStep = navSteps[currentStepIdx];
+    const idx = findClosestStepIndex(currentPos, navSteps);
+    const nextStep = navSteps[idx];
     if (!nextStep) return;
 
     const stepLat = nextStep.start_location.lat;
     const stepLng = nextStep.start_location.lng;
-    const dist = calculateDistance([
-      currentPos,
-      { latitude: stepLat, longitude: stepLng }
-    ]);
-    if (dist < 0.04) { // 40 Meter vor dem Step
-      const instruction = nextStep.html_instructions.replace(/<[^>]+>/g, '');
-      speechQueue.current.push(instruction);
-      setCurrentStepIdx(idx => idx + 1);
+    const dist = getDistance(currentPos, { latitude: stepLat, longitude: stepLng });
+
+    // Übersetze und optimiere die Anweisung:
+    const germanInstruction = getGermanInstruction(nextStep);
+
+    // "In xx Metern"-Ansage (zwischen 15 und 80 Meter)
+    if (dist < 0.08 && dist > 0.015) {
+      const msg = `In ${Math.round(dist * 1000)} Metern: ${germanInstruction}`;
+      enqueueSpeech('nav', msg);
     }
-  }, [path, tracking, navSteps, currentStepIdx, routeCoordinates]);
+    // "Jetzt"-Ansage (< 15 Meter)
+    else if (dist <= 0.015) {
+      const msg = `Jetzt: ${germanInstruction}`;
+      enqueueSpeech('nav', msg);
+    }
+  }, [path, tracking, navSteps, routeCoordinates]);
+
+  // useEffect(() => {
+  //   if (!tracking || navSteps.length < 5 || path.length === 0) return;
+  //   const currentPos = path[path.length - 1];
+
+  //   // Finde den nächsten Step, der weniger als 10 Meter entfernt ist
+  //   let idx = -1;
+  //   for (let i = lastStepIdxSpoken + 1; i < navSteps.length; i++) {
+  //     const d = calculateDistance([currentPos, navSteps[i]]);
+  //     if (d < 0.01) { // 10 Meter
+  //       idx = i;
+  //       break;
+  //     }
+  //   }
+  //   if (idx === -1) return;
+
+  //   // Prüfe Richtungsänderung nach 4 Steps (~40 Meter)
+  //   if (idx + 4 < navSteps.length) {
+  //     const bearingNow = getBearing(navSteps[idx], navSteps[idx + 1]);
+  //     const bearingFuture = getBearing(navSteps[idx], navSteps[idx + 4]);
+  //     let angleDiff = Math.abs(bearingFuture - bearingNow);
+  //     if (angleDiff > 180) angleDiff = 360 - angleDiff;
+  //     if (angleDiff > 30 && idx > lastStepIdxSpoken) {
+  //       // Ansage machen
+  //       let instruction = '';
+  //       if (angleDiff > 120) {
+  //         instruction = 'Wende dich!';
+  //       } else if (bearingFuture - bearingNow > 0) {
+  //         instruction = 'Rechts abbiegen';
+  //       } else {
+  //         instruction = 'Links abbiegen';
+  //       }
+  //       enqueueSpeech('nav', instruction);
+  //       setLastStepIdxSpoken(idx);
+  //     }
+  //   }
+  // }, [path, tracking, navSteps, lastStepIdxSpoken]);
+
+  // useEffect(() => {
+  //   if (
+  //     !tracking ||
+  //     navSteps.length === 0 ||
+  //     path.length === 0 ||
+  //     !routeCoordinates
+  //   ) return;
+  //   const currentPos = path[path.length - 1];
+  //   const nextStep = navSteps[currentStepIdx];
+  //   if (!nextStep) return;
+
+  //   function distanceToSegment(p: LatLng, v: LatLng, w: LatLng) {
+  //     const toRad = (value: number) => (value * Math.PI) / 180;
+  //     const R = 6371;
+  //     const lat1 = toRad(v.latitude);
+  //     const lon1 = toRad(v.longitude);
+  //     const lat2 = toRad(w.latitude);
+  //     const lon2 = toRad(w.longitude);
+  //     const latP = toRad(p.latitude);
+  //     const lonP = toRad(p.longitude);
+
+  //     const A = { x: lat1, y: lon1 };
+  //     const B = { x: lat2, y: lon2 };
+  //     const P = { x: latP, y: lonP };
+  //     const AB = { x: B.x - A.x, y: B.y - A.y };
+  //     const AP = { x: P.x - A.x, y: P.y - A.y };
+  //     const ab2 = AB.x * AB.x + AB.y * AB.y;
+  //     const ap_ab = AP.x * AB.x + AP.y * AB.y;
+  //     let t = ab2 === 0 ? 0 : ap_ab / ab2;
+  //     t = Math.max(0, Math.min(1, t));
+  //     const closest = { x: A.x + AB.x * t, y: A.y + AB.y * t };
+
+  //     const dLat = P.x - closest.x;
+  //     const dLon = P.y - closest.y;
+  //     const a = Math.sin(dLat / 2) ** 2 +
+  //       Math.sin(dLon / 2) ** 2 * Math.cos(P.x) * Math.cos(closest.x);
+  //     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  //     return R * c; // in km
+  //   }
+
+  //   const stepStart = { latitude: nextStep.start_location.lat, longitude: nextStep.start_location.lng };
+  //   const stepEnd = { latitude: nextStep.end_location.lat, longitude: nextStep.end_location.lng };
+  //   const distToStep = distanceToSegment(currentPos, stepStart, stepEnd);
+
+  //   // --- Nur einmal pro Step ansagen ---
+  //   if (distToStep < 0.04 && currentStepIdx > lastStepIdxSpoken) {
+  //     const maneuverMap: Record<string, string> = {
+  //       'turn-right': 'Rechts abbiegen',
+  //       'turn-left': 'Links abbiegen',
+  //       'straight': 'Geradeaus weiterlaufen',
+  //       'uturn-left': 'Wende nach links',
+  //       'uturn-right': 'Wende nach rechts',
+  //       'fork-right': 'An der Gabelung rechts halten',
+  //       'fork-left': 'An der Gabelung links halten',
+  //       'merge': 'Zusammenführen',
+  //       'ramp-right': 'Rechts auf die Rampe',
+  //       'ramp-left': 'Links auf die Rampe',
+  //     };
+  //     for (let i = currentStepIdx; i < Math.min(currentStepIdx + 5, navSteps.length); i++) {
+  //       const step = navSteps[i];
+  //       const stepStart = {
+  //         latitude: step.start_location.lat,
+  //         longitude: step.start_location.lng,
+  //       };
+  //       const stepEnd = {
+  //         latitude: step.end_location.lat,
+  //         longitude: step.end_location.lng,
+  //       };
+
+  //       const distToStep = distanceToSegment(currentPos, stepStart, stepEnd);
+
+  //       if (distToStep < 0.04 && i > lastStepIdxSpoken) {
+  //         let instruction = '';
+  //         if (step.maneuver && maneuverMap[step.maneuver]) {
+  //           instruction = maneuverMap[step.maneuver];
+  //         } else {
+  //           instruction = step.html_instructions.replace(/<[^>]+>/g, '');
+  //           instruction = instruction.replace(/nach (Norden|Süden|Westen|Osten)/gi, 'geradeaus');
+  //         }
+
+  //         enqueueSpeech('nav', instruction);
+  //         setLastStepIdxSpoken(i);
+  //         setCurrentStepIdx(i + 1);
+  //         break;
+  //       }
+  //     }
+  //   }
+  // }, [path, tracking, navSteps, currentStepIdx, routeCoordinates, lastStepIdxSpoken]);
   // --- ENDE GOOGLE DIRECTIONS NAVIGATION ---
+
+    const flatTargetRoute =
+      Array.isArray(targetRoute) && Array.isArray(targetRoute[0])
+        ? targetRoute.flat()
+        : targetRoute;
 
   return (
     <View style={{ flex: 1 }}>
@@ -657,8 +1014,8 @@ export default function ActivityScreen() {
           <Polyline coordinates={path} strokeWidth={5} strokeColor="blue" />
         )}
         {/* --- GOOGLE DIRECTIONS NAVIGATION --- */}
-        {routeCoordinates && polylineCoords.length > 0 && (
-          <Polyline coordinates={polylineCoords} strokeWidth={3} strokeColor="green" />
+        {flatTargetRoute && flatTargetRoute.length > 1 && (
+          <Polyline coordinates={flatTargetRoute} strokeWidth={3} strokeColor="green" />
         )}
         {/* --- ENDE GOOGLE DIRECTIONS NAVIGATION --- */}
       </MapView>
@@ -688,7 +1045,7 @@ export default function ActivityScreen() {
           </View>
           <View style={styles.metric}>
             <Text style={styles.metricValue}>
-              {isFinite(averagePace) ? averagePace.toFixed(2) : '0.00'}
+              {isFinite(averagePace) ? formatPace(averagePace) : '0:00'}
             </Text>
             <Text>Ø Pace (min/km)</Text>
           </View>
