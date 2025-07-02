@@ -33,97 +33,144 @@ export function getDistanceInMeters(from: LatLng, to: LatLng): number {
   return R * c;
 }
 
-// Finde nächsten Wegpunkt auf der Route
-export function findNextWaypoint(currentPos: LatLng, route: LatLng[], lastWaypointIndex: number): {
-  nextWaypoint: LatLng | null;
-  nextIndex: number;
-  distanceToNext: number;
+// Finde signifikante Abbiegepunkte auf der Route
+export function findTurningPoints(route: LatLng[], minTurnAngle: number = 30): {
+  point: LatLng;
+  index: number;
+  turnAngle: number;
+}[] {
+  if (route.length < 3) return [];
+  
+  const turningPoints = [];
+  
+  for (let i = 1; i < route.length - 1; i++) {
+    const prevPoint = route[i - 1];
+    const currentPoint = route[i];
+    const nextPoint = route[i + 1];
+    
+    // Berechne Bearing vor und nach dem aktuellen Punkt
+    const bearingBefore = getBearing(prevPoint, currentPoint);
+    const bearingAfter = getBearing(currentPoint, nextPoint);
+    
+    // Berechne Winkeländerung
+    let angleDiff = bearingAfter - bearingBefore;
+    if (angleDiff > 180) angleDiff -= 360;
+    if (angleDiff < -180) angleDiff += 360;
+    
+    // Nur signifikante Abbiegungen berücksichtigen
+    if (Math.abs(angleDiff) >= minTurnAngle) {
+      turningPoints.push({
+        point: currentPoint,
+        index: i,
+        turnAngle: angleDiff
+      });
+    }
+  }
+  
+  return turningPoints;
+}
+
+// Finde den nächsten relevanten Abbiegepunkt
+export function findNextTurningPoint(
+  currentPos: LatLng, 
+  route: LatLng[], 
+  lastProcessedIndex: number
+): {
+  turningPoint: LatLng | null;
+  index: number;
+  distance: number;
+  turnAngle: number;
 } {
-  if (!route || route.length === 0) {
-    return { nextWaypoint: null, nextIndex: -1, distanceToNext: 0 };
-  }
-
-  // Suche ab dem letzten bekannten Index + einige Punkte voraus
-  const searchStart = Math.max(0, lastWaypointIndex - 2);
-  const searchEnd = Math.min(route.length, lastWaypointIndex + 10);
+  // Finde alle Abbiegepunkte
+  const turningPoints = findTurningPoints(route, 35); // Mindestens 35° für Abbiegung
   
-  let closestIndex = lastWaypointIndex;
-  let minDistance = Infinity;
-  
-  // Finde den nächsten Punkt auf der Route
-  for (let i = searchStart; i < searchEnd; i++) {
-    const distance = getDistanceInMeters(currentPos, route[i]);
-    if (distance < minDistance) {
-      minDistance = distance;
-      closestIndex = i;
+  // Finde den nächsten Abbiegepunkt nach dem letzten verarbeiteten Index
+  for (const tp of turningPoints) {
+    if (tp.index > lastProcessedIndex) {
+      const distance = getDistanceInMeters(currentPos, tp.point);
+      
+      // Nur Abbiegepunkte in angemessener Entfernung berücksichtigen (20-200m)
+      if (distance >= 20 && distance <= 200) {
+        return {
+          turningPoint: tp.point,
+          index: tp.index,
+          distance,
+          turnAngle: tp.turnAngle
+        };
+      }
     }
   }
   
-  // Finde den nächsten Wegpunkt, der weit genug entfernt ist für Navigation
-  for (let i = closestIndex + 1; i < route.length; i++) {
-    const distance = getDistanceInMeters(currentPos, route[i]);
-    if (distance > 15) { // Mindestens 15 Meter entfernt
-      return {
-        nextWaypoint: route[i],
-        nextIndex: i,
-        distanceToNext: distance
-      };
-    }
-  }
-  
-  return { nextWaypoint: null, nextIndex: closestIndex, distanceToNext: 0 };
+  return {
+    turningPoint: null,
+    index: lastProcessedIndex,
+    distance: 0,
+    turnAngle: 0
+  };
 }
 
-// Bestimme Richtungsanweisung basierend auf Bearing-Änderung
-export function getDirectionInstruction(currentBearing: number, nextBearing: number): string | null {
-  let angleDiff = nextBearing - currentBearing;
+// Bestimme Richtungsanweisung basierend auf Winkeländerung
+export function getTurnInstruction(turnAngle: number): string {
+  const absAngle = Math.abs(turnAngle);
   
-  // Normalisiere Winkel auf -180 bis 180
-  if (angleDiff > 180) angleDiff -= 360;
-  if (angleDiff < -180) angleDiff += 360;
-  
-  // Nur bei größeren Richtungsänderungen Ansage machen
-  if (Math.abs(angleDiff) < 25) {
-    return null; // Geradeaus, keine Ansage nötig
+  if (absAngle >= 150) return "Wende dich um";
+  if (absAngle >= 90) {
+    return turnAngle > 0 ? "Scharf rechts abbiegen" : "Scharf links abbiegen";
   }
-  
-  if (angleDiff > 120) return "Wende dich um";
-  if (angleDiff < -120) return "Wende dich um";
-  if (angleDiff > 45) return "Rechts abbiegen";
-  if (angleDiff < -45) return "Links abbiegen";
-  if (angleDiff > 0) return "Leicht rechts halten";
-  return "Leicht links halten";
+  if (absAngle >= 45) {
+    return turnAngle > 0 ? "Rechts abbiegen" : "Links abbiegen";
+  }
+  return turnAngle > 0 ? "Leicht rechts halten" : "Leicht links halten";
 }
 
-// Hauptfunktion für Navigation
+// Hauptfunktion für Navigation mit verbesserter Logik
 export function getNavigationInstruction(
   currentPos: LatLng, 
   route: LatLng[], 
-  lastWaypointIndex: number,
+  lastProcessedIndex: number,
   currentBearing?: number
 ): {
   instruction: string | null;
   distance: number;
   newWaypointIndex: number;
 } {
-  const { nextWaypoint, nextIndex, distanceToNext } = findNextWaypoint(currentPos, route, lastWaypointIndex);
+  const { turningPoint, index, distance, turnAngle } = findNextTurningPoint(
+    currentPos, 
+    route, 
+    lastProcessedIndex
+  );
   
-  if (!nextWaypoint || distanceToNext === 0) {
-    return { instruction: null, distance: 0, newWaypointIndex: lastWaypointIndex };
+  if (!turningPoint || distance === 0) {
+    return { 
+      instruction: null, 
+      distance: 0, 
+      newWaypointIndex: lastProcessedIndex 
+    };
   }
   
-  // Berechne Bearing zum nächsten Wegpunkt
-  const bearingToNext = getBearing(currentPos, nextWaypoint);
-  
-  // Wenn wir einen aktuellen Bearing haben, berechne Richtungsanweisung
-  let instruction: string | null = null;
-  if (currentBearing !== undefined) {
-    instruction = getDirectionInstruction(currentBearing, bearingToNext);
+  // Nur Ansage machen, wenn wir uns dem Abbiegepunkt nähern
+  if (distance <= 100) {
+    const instruction = getTurnInstruction(turnAngle);
+    return {
+      instruction,
+      distance,
+      newWaypointIndex: index
+    };
   }
   
-  return {
-    instruction,
-    distance: distanceToNext,
-    newWaypointIndex: nextIndex
+  return { 
+    instruction: null, 
+    distance: 0, 
+    newWaypointIndex: lastProcessedIndex 
   };
+}
+
+// Prüfe ob der Benutzer einen Abbiegepunkt passiert hat
+export function hasPassedTurningPoint(
+  currentPos: LatLng,
+  turningPoint: LatLng,
+  threshold: number = 15
+): boolean {
+  const distance = getDistanceInMeters(currentPos, turningPoint);
+  return distance <= threshold;
 }

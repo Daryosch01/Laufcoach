@@ -548,18 +548,6 @@ export default function ActivityScreen() {
       lastPaceFeedbackMeter.current = 0;
     }
 
-    // DEBUG: Logge alle relevanten Werte
-    // console.log(
-    //   'distance:', distance,
-    //   'currentKm:', currentKm,
-    //   'meterInKm:', meterInKm,
-    //   'averagePace:', averagePace,
-    //   'targetPace:', targetPace,
-    //   'paceDiff:', averagePace - (targetPace ?? 0),
-    //   'lastPaceFeedbackKm:', lastPaceFeedbackKm.current,
-    //   'paceFeedbacksThisKm:', paceFeedbacksThisKm.current,
-    //   'lastPaceFeedbackMeter:', lastPaceFeedbackMeter.current
-    // );
 
     // --- Kilometeransage + Motivation ---
     if (
@@ -672,26 +660,6 @@ export default function ActivityScreen() {
       }
     );
 
-    // watchRef.current = await Location.watchPositionAsync(
-    //   {
-    //     accuracy: Location.Accuracy.Highest,
-    //     timeInterval: 1000,
-    //     distanceInterval: 1,
-    //   },
-    //   (loc) => {
-    //     const newCoord = {
-    //       latitude: loc.coords.latitude,
-    //       longitude: loc.coords.longitude,
-    //     };
-    //     setRegion(newCoord);
-    //     setPath((prev) => {
-    //       const updated = [...prev, newCoord];
-    //       const dist = calculateDistance(updated);
-    //       setDistance(dist);
-    //       return updated;
-    //     });
-    //   }
-    // );
   };
 
   const beginCountdown = () => {
@@ -846,191 +814,51 @@ export default function ActivityScreen() {
     const movementBearing = getBearing(prevPos, currentPos);
     setCurrentBearing(movementBearing);
     
-    // Hole Navigation-Anweisung
+    // Hole Navigation-Anweisung nur für signifikante Abbiegungen
     const navResult = getNavigationInstruction(currentPos, flatTargetRoute, lastWaypointIndex, movementBearing);
     
     if (navResult.instruction && navResult.distance > 0) {
       const now = Date.now();
       const timeSinceLastNav = now - lastNavTime.current;
       
-      // Verhindere Spam: Mindestens 10 Sekunden zwischen gleichen Anweisungen
-      if (navResult.instruction !== lastNavInstruction.current || timeSinceLastNav > 10000) {
+      // Verhindere Spam: Mindestens 15 Sekunden zwischen Anweisungen UND 
+      // unterschiedliche Anweisungen oder erheblich andere Entfernung
+      const distanceDiff = Math.abs(navResult.distance - (lastNavDistance.current || 0));
+      const shouldAnnounce = (
+        navResult.instruction !== lastNavInstruction.current || 
+        timeSinceLastNav > 15000 ||
+        distanceDiff > 30
+      );
+      
+      if (shouldAnnounce) {
         let message = '';
         
-        if (navResult.distance <= 50) {
+        if (navResult.distance <= 30) {
+          message = `Gleich: ${navResult.instruction}`;
+        } else if (navResult.distance <= 50) {
           message = `In ${Math.round(navResult.distance)} Metern: ${navResult.instruction}`;
         } else if (navResult.distance <= 100) {
-          message = `In etwa ${Math.round(navResult.distance)} Metern: ${navResult.instruction}`;
+          message = `In etwa ${Math.round(navResult.distance / 10) * 10} Metern: ${navResult.instruction}`;
         }
         
         if (message) {
           enqueueSpeech('nav', message);
           lastNavInstruction.current = navResult.instruction;
+          lastNavDistance.current = navResult.distance;
           lastNavTime.current = now;
         }
       }
     }
     
-    // Update Waypoint Index
-    if (navResult.newWaypointIndex > lastWaypointIndex) {
+    // Update Waypoint Index nur wenn deutlich fortgeschritten
+    if (navResult.newWaypointIndex > lastWaypointIndex + 5) {
       setLastWaypointIndex(navResult.newWaypointIndex);
     }
   }, [path, tracking, flatTargetRoute, lastWaypointIndex]);
+
+  // Zusätzlich musst du diese Refs zu deinen anderen useRef-Definitionen hinzufügen:
+  const lastNavDistance = useRef<number>(0);
   // --- ENDE EINFACHE NAVIGATION ---
-
-
-  // const [lastStepIdxSpoken, setLastStepIdxSpoken] = useState(-1);
-
-  // function getBearing(a: LatLng, b: LatLng) {
-  //   const toRad = (v: number) => (v * Math.PI) / 180;
-  //   const toDeg = (v: number) => (v * 180) / Math.PI;
-  //   const dLon = toRad(b.longitude - a.longitude);
-  //   const lat1 = toRad(a.latitude);
-  //   const lat2 = toRad(b.latitude);
-  //   const y = Math.sin(dLon) * Math.cos(lat2);
-  //   const x = Math.cos(lat1) * Math.sin(lat2) -
-  //             Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
-  //   return (toDeg(Math.atan2(y, x)) + 360) % 360;
-  // }
-
-
-  // useEffect(() => {
-  //   if (!tracking || navSteps.length < 5 || path.length === 0) return;
-  //   const currentPos = path[path.length - 1];
-
-  //   // Finde den nächsten Step, der weniger als 10 Meter entfernt ist
-  //   let idx = -1;
-  //   for (let i = lastStepIdxSpoken + 1; i < navSteps.length; i++) {
-  //     const d = calculateDistance([currentPos, navSteps[i]]);
-  //     if (d < 0.01) { // 10 Meter
-  //       idx = i;
-  //       break;
-  //     }
-  //   }
-  //   if (idx === -1) return;
-
-  //   // Prüfe Richtungsänderung nach 4 Steps (~40 Meter)
-  //   if (idx + 4 < navSteps.length) {
-  //     const bearingNow = getBearing(navSteps[idx], navSteps[idx + 1]);
-  //     const bearingFuture = getBearing(navSteps[idx], navSteps[idx + 4]);
-  //     let angleDiff = Math.abs(bearingFuture - bearingNow);
-  //     if (angleDiff > 180) angleDiff = 360 - angleDiff;
-  //     if (angleDiff > 30 && idx > lastStepIdxSpoken) {
-  //       // Ansage machen
-  //       let instruction = '';
-  //       if (angleDiff > 120) {
-  //         instruction = 'Wende dich!';
-  //       } else if (bearingFuture - bearingNow > 0) {
-  //         instruction = 'Rechts abbiegen';
-  //       } else {
-  //         instruction = 'Links abbiegen';
-  //       }
-  //       enqueueSpeech('nav', instruction);
-  //       setLastStepIdxSpoken(idx);
-  //     }
-  //   }
-  // }, [path, tracking, navSteps, lastStepIdxSpoken]);
-
-  /*
-    useEffect(() => {
-      if (
-        !tracking ||
-        navSteps.length === 0 ||
-        path.length === 0 ||
-        !routeCoordinates
-      ) return;
-      const currentPos = path[path.length - 1];
-      const nextStep = navSteps[currentStepIdx];
-      if (!nextStep) return;
-
-      function distanceToSegment(p: LatLng, v: LatLng, w: LatLng) {
-        const toRad = (value: number) => (value * Math.PI) / 180;
-        const R = 6371;
-        const lat1 = toRad(v.latitude);
-        const lon1 = toRad(v.longitude);
-        const lat2 = toRad(w.latitude);
-        const lon2 = toRad(w.longitude);
-        const latP = toRad(p.latitude);
-        const lonP = toRad(p.longitude);
-
-        const A = { x: lat1, y: lon1 };
-        const B = { x: lat2, y: lon2 };
-        const P = { x: latP, y: lonP };
-        const AB = { x: B.x - A.x, y: B.y - A.y };
-        const AP = { x: P.x - A.x, y: P.y - A.y };
-        const ab2 = AB.x * AB.x + AB.y * AB.y;
-        const ap_ab = AP.x * AB.x + AP.y * AB.y;
-        let t = ab2 === 0 ? 0 : ap_ab / ab2;
-        t = Math.max(0, Math.min(1, t));
-        const closest = { x: A.x + AB.x * t, y: A.y + AB.y * t };
-
-        const dLat = P.x - closest.x;
-        const dLon = P.y - closest.y;
-        const a = Math.sin(dLat / 2) ** 2 +
-          Math.sin(dLon / 2) ** 2 * Math.cos(P.x) * Math.cos(closest.x);
-        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-        return R * c; // in km
-      }
-
-      //const stepStart = { latitude: nextStep.start_location.lat, longitude: nextStep.start_location.lng };
-      //const stepEnd = { latitude: nextStep.end_location.lat, longitude: nextStep.end_location.lng };
-      // RICHTIG:
-      const stepStart = { latitude: nextStep.latitude, longitude: nextStep.longitude };
-      // Wenn du einen Endpunkt brauchst, nimm navSteps[currentStepIdx+1] (sofern vorhanden):
-      const stepEnd = navSteps[currentStepIdx + 1]
-        ? { latitude: navSteps[currentStepIdx + 1].latitude, longitude: navSteps[currentStepIdx + 1].longitude }
-        : stepStart;  
-      
-      const distToStep = distanceToSegment(currentPos, stepStart, stepEnd);
-
-      // --- Nur einmal pro Step ansagen ---
-      if (distToStep < 0.04 && currentStepIdx > lastStepIdxSpoken) {
-        const maneuverMap: Record<string, string> = {
-          'turn-right': 'Rechts abbiegen',
-          'turn-left': 'Links abbiegen',
-          'straight': 'Geradeaus weiterlaufen',
-          'uturn-left': 'Wende nach links',
-          'uturn-right': 'Wende nach rechts',
-          'fork-right': 'An der Gabelung rechts halten',
-          'fork-left': 'An der Gabelung links halten',
-          'merge': 'Zusammenführen',
-          'ramp-right': 'Rechts auf die Rampe',
-          'ramp-left': 'Links auf die Rampe',
-        };
-        for (let i = currentStepIdx; i < Math.min(currentStepIdx + 5, navSteps.length); i++) {
-          const step = navSteps[i];
-          const stepStart = {
-            latitude: step.start_location.lat,
-            longitude: step.start_location.lng,
-          };
-          const stepEnd = {
-            latitude: step.end_location.lat,
-            longitude: step.end_location.lng,
-          };
-
-          const distToStep = distanceToSegment(currentPos, stepStart, stepEnd);
-
-          if (distToStep < 0.04 && i > lastStepIdxSpoken) {
-            let instruction = '';
-            if (step.maneuver && maneuverMap[step.maneuver]) {
-              instruction = maneuverMap[step.maneuver];
-            } else {
-              instruction = step.html_instructions.replace(/<[^>]+>/g, '');
-              instruction = instruction.replace(/nach (Norden|Süden|Westen|Osten)/gi, 'geradeaus');
-            }
-
-            enqueueSpeech('nav', instruction);
-            setLastStepIdxSpoken(i);
-            setCurrentStepIdx(i + 1);
-            break;
-          }
-        }
-      }
-    }, [path, tracking, navSteps, currentStepIdx, routeCoordinates, lastStepIdxSpoken]);
-  */
-  // --- ENDE GOOGLE DIRECTIONS NAVIGATION ---
-
-
 
   return (
     <View style={{ flex: 1 }}>
