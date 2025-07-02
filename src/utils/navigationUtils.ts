@@ -14,23 +14,31 @@ export function getDistance(a: LatLng, b: LatLng): number {
   return R * c;
 }
 
-// --- Finde den Index des Steps, der dem Nutzer am nächsten ist
+// --- Finde den Index des Steps, der dem Nutzer am nächsten ist (robust für beide Typen!)
 export function findClosestStepIndex(current: LatLng, steps: any[]): number {
   if (!steps || steps.length === 0) return 0;
   let minDist = Infinity;
   let idx = 0;
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
-    // ALT:
-    // const dist = getDistance(current, {
-    //   latitude: step.start_location.lat,
-    //   longitude: step.start_location.lng,
-    // });
-    // NEU:
-    const dist = getDistance(current, {
-      latitude: step.latitude,
-      longitude: step.longitude,
-    });
+    let lat: number|undefined, lng: number|undefined;
+
+    // 1. Google Directions Step mit start_location
+    if (step && step.start_location && typeof step.start_location.lat === 'number' && typeof step.start_location.lng === 'number') {
+      lat = step.start_location.lat;
+      lng = step.start_location.lng;
+    } 
+    // 2. LatLng Punkt (polyline)
+    else if (typeof step.latitude === 'number' && typeof step.longitude === 'number') {
+      lat = step.latitude;
+      lng = step.longitude;
+    } else {
+      continue; // skip invalid
+    }
+    if (lat === undefined || lng === undefined) {
+      continue;
+    }
+    const dist = getDistance(current, { latitude: lat, longitude: lng });
     if (dist < minDist) {
       minDist = dist;
       idx = i;
@@ -78,11 +86,11 @@ const maneuverToGerman: Record<string, string> = {
 
 export function getGermanInstruction(step: any): string {
   // 1. Mapping für Manöver verwenden, falls vorhanden
-  if (step.maneuver && maneuverToGerman[step.maneuver]) {
+  if (step && step.maneuver && maneuverToGerman[step.maneuver]) {
     return maneuverToGerman[step.maneuver];
   }
   // 2. Sonst die html_instruction nehmen und aufräumen
-  let instruction = step.html_instructions?.replace(/<[^>]+>/g, '') || '';
+  let instruction = step?.html_instructions?.replace(/<[^>]+>/g, '') || '';
   // Einfache Ersetzungen für häufige englische Anweisungen
   instruction = instruction
     .replace('Turn right', 'Rechts abbiegen')
@@ -92,5 +100,5 @@ export function getGermanInstruction(step: any): string {
     .replace('Destination will be on the right', 'Das Ziel befindet sich rechts')
     .replace('Destination will be on the left', 'Das Ziel befindet sich links');
   // ... du kannst hier beliebig weitere Ersetzungen machen!
-  return instruction;
+  return instruction || 'Weiterlaufen';
 }
