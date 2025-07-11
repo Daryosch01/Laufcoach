@@ -32,6 +32,7 @@ yarn-error.*
 
 # local env files
 .env*.local
+.env # Ignoring the main .env file for security reasons
 
 # typescript
 *.tsbuildinfo
